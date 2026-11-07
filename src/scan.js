@@ -168,6 +168,9 @@ export async function analyzePaths(paths, config, onProgress) {
     }
     if (config.by === "component") {
       const units = analyzeComponents(code, file, config);
+      // Recovered parse errors affect the entire file, not just an individual row.
+      const partial = units.find((unit) => unit.partial && unit.parseError);
+      if (partial) errors.push(partial);
       for (const unit of units) {
         if (unit.parseError && !unit.partial) {
           errors.push(unit);

@@ -4,11 +4,38 @@ import { round } from "./score.js";
 
 export function formatReport(report, config) {
   if (config.format === "json") return formatJson(report, config);
+  if (report.comparison) return formatBaselineComparison(report.comparison, config);
   if (config.format === "csv") return formatCsv(report, config);
   if (config.format === "md") return formatMarkdown(report, config);
   if (config.format === "list") return formatList(report, config);
   if (report.explain) return formatExplanations(report, config);
   return formatTable(report, config);
+}
+
+export function formatBaselineComparison(comparison, config) {
+  const headers = ["Status", "Before", "After", "Delta", "Regression", "File"];
+  const rows = comparison.changes.map((item) => [
+    item.status,
+    item.previousScore === null ? "—" : formatPrecise(item.previousScore),
+    item.currentScore === null ? "—" : formatPrecise(item.currentScore),
+    `${item.delta > 0 ? "+" : ""}${formatPrecise(item.delta)}`,
+    item.regression ? "yes" : "no",
+    `${item.file}${item.name ? `:${item.name}` : ""}`,
+  ]);
+  if (config.format === "csv") return [headers, ...rows].map((row) => row.map(csvEscape).join(",")).join("\n");
+  if (config.format === "md") return [headers, headers.map(() => "---"), ...rows].map((row) => `| ${row.map(mdEscape).join(" | ")} |`).join("\n");
+  if (config.format === "list") return rows.map((row) => row.join("\t")).join("\n");
+  const widths = headers.map((header, index) => rows.reduce((width, row) => Math.max(width, visibleLength(row[index])), header.length));
+  const lines = [`Baseline: ${comparison.file || "(in memory)"} · score tolerance ${comparison.tolerance}`];
+  if (rows.length) {
+    lines.push(headers.map((cell, i) => padEnd(cell, widths[i])).join("  "));
+    for (const row of rows) lines.push(row.map((cell, i) => padEnd(cell, widths[i])).join("  "));
+  } else lines.push("No complexity changes.");
+  if (!config.quiet) {
+    const s = comparison.summary;
+    lines.push("", `${s.new} new · ${s.worsened} worsened · ${s.improved} improved · ${s.removed} removed · ${s.unchanged} unchanged · ${s.regressions} regressions`);
+  }
+  return lines.join("\n");
 }
 
 export function formatExplanation(result, config) {
@@ -41,6 +68,17 @@ export function formatExplanation(result, config) {
     lines.push("");
     lines.push("  notes:");
     for (const note of result.notes) lines.push(`    - ${note}`);
+  }
+  if (result.findings?.length) {
+    lines.push("");
+    lines.push("  findings (review signals, not confirmed defects):");
+    const file = relativeName({ file: result.file }, config);
+    for (const [index, finding] of result.findings.entries()) {
+      const { line, column } = finding.location.start;
+      lines.push(`    ${config.numberFindings ? `[${index + 1}] ` : ""}${file}:${line}:${column} — ${finding.message}`);
+      if (finding.evidence) lines.push(`      > ${finding.evidence}`);
+      lines.push(`      ${finding.suggestion}`);
+    }
   }
   if (result.parseError) {
     lines.push("");
@@ -131,6 +169,7 @@ function formatJson(report, config) {
       absolutePath: result.file,
       name: result.name,
       kind: result.kind,
+      location: result.location || null,
       score: result.score,
       density: result.density,
       drivers: result.drivers,
@@ -138,7 +177,9 @@ function formatJson(report, config) {
       breakdown: result.breakdown,
       components: result.components,
       notes: result.notes,
+      findings: result.findings || [],
       parseError: result.parseError,
+      partial: Boolean(result.partial),
     })),
     errors: report.errors.map((error) => ({
       file: relativeName(error, config),
@@ -151,6 +192,8 @@ function formatJson(report, config) {
       limit: item.failedLimit,
     })),
     skipped: report.skipped || [],
+    ...(report.comparison ? { comparison: report.comparison } : {}),
+    ...(report.baselineSaved ? { baselineSaved: report.baselineSaved } : {}),
   };
   return JSON.stringify(payload, null, config.compact ? 0 : 2);
 }
@@ -278,10 +321,15 @@ Score:
   score   = Σ max(0, metric - baseline) × weight
   density = score / sloc × 100
 
-  cognitive follows SonarSource: control-flow breaks add 1, plus the nesting
+  cognitive is Sonar-style: control-flow breaks add 1, plus the nesting
   level. else / else-if add 1 with no nesting bonus. Nested functions increase
-  nesting. A run of the same &&, ||, or ?? operator adds 1, not 1 per operator.
+  nesting. A run of the same && or || operator adds 1, not 1 per operator.
+  Nullish coalescing adds cyclomatic decisions but no cognitive points.
   effects are an extra penalty on top of hooks.
+
+  Explanations include source-linked findings and contextual suggestions.
+  Findings are review signals, not confirmed defects or performance problems.
+  maxProps counts explicit destructuring only; opaque props shapes are unknown.
 
   A single file prints a breakdown. A directory prints a ranked table.
   Pass a path to scan a repo other than the current directory.
@@ -289,6 +337,7 @@ Score:
 Examples:
   react-complexity
   react-complexity src --top 10
+  react-complexity src --interactive --by component
   react-complexity src --sort density
   react-complexity src/App.tsx
   react-complexity src --weight jsxDepth=4 --weight sloc=0
@@ -296,6 +345,9 @@ Examples:
   react-complexity src --format json > report.json
   react-complexity --init
   react-complexity src --max-score 80 --quiet
+  react-complexity src --save-baseline complexity-baseline.json
+  react-complexity src --compare-baseline complexity-baseline.json
+  react-complexity src --compare-baseline complexity-baseline.json --baseline-tolerance 2
 
 Options:
   -c, --config <file>       Config file (mjs, js, cjs, json)
@@ -304,6 +356,8 @@ Options:
   -r, --reverse             Low to high
   -f, --format <fmt>        table, json, csv, md, list
   -e, --explain             Breakdown for each shown row
+  -i, --interactive         Browse rankings and findings in a terminal
+      --editor <command>   Editor command (default VISUAL, EDITOR, then code)
       --ext <list>          Extensions, comma-separated (default jsx,tsx,js,ts)
       --ignore <pattern>    Extra gitignore-style pattern (repeatable)
       --include-tests       Include test and spec files
@@ -318,6 +372,10 @@ Options:
       --min-score <n>       Hide rows below this score
       --max-score <n>       Exit 1 if any file's score is higher
       --fail-on <k=v>       Exit 1 if a metric exceeds a value
+      --save-baseline <file> Save all entries to a versioned JSON baseline
+      --compare-baseline <file> Report changes; exit 1 for score regressions
+      --baseline-tolerance <n> Allowed increase per entry (default 0)
+      --force              Allow replacing an existing baseline/config file
       --init [file]         Write a config template (default react-complexity.config.mjs)
       --show-config         Print the resolved config and exit
       --strict              Exit 1 on parse errors

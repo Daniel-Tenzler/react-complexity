@@ -1,5 +1,5 @@
 import { VISITOR_KEYS } from "@babel/types";
-import { emptyMetrics } from "./schema.js";
+import { emptyMetrics, DEFAULT_NOTE_THRESHOLDS, DEFAULT_REACT_PACKAGES } from "./schema.js";
 
 const FUNCTION_NODES = new Set([
   "FunctionDeclaration",
@@ -35,6 +35,11 @@ const EFFECT_HOOKS = new Set([
 
 const STATE_HOOKS = new Set(["useState", "useReducer"]);
 const MEMO_HOOKS = new Set(["useMemo", "useCallback"]);
+const REACT_HOOKS = new Set([
+  ...EFFECT_HOOKS, ...STATE_HOOKS, ...MEMO_HOOKS,
+  "useContext", "useRef", "useDebugValue", "useId", "useTransition",
+  "useDeferredValue", "useSyncExternalStore", "useActionState", "useOptimistic", "useEffectEvent",
+]);
 const SKIP_WALK_KEYS = new Set(["typeAnnotation", "returnType", "typeParameters", "predicate"]);
 
 export function measure(program, options, skipNodes) {
@@ -49,7 +54,9 @@ export function measure(program, options, skipNodes) {
     jsxDepth: 0,
     skipNodes: skipNodes || null,
     nestedDecisions: 0,
+    functionNames: new WeakMap(),
   };
+  declareStatements(options.program?.body || (program.type === "Program" ? program.body : []), state);
   walk(program, 0, state);
   return metrics;
 }
@@ -77,6 +84,12 @@ function walk(node, nesting, state) {
   if (nesting > state.metrics.maxNesting) state.metrics.maxNesting = nesting;
 
   switch (node.type) {
+    case "BlockStatement":
+      state.scopes.push(new Map());
+      declareStatements(node.body, state);
+      for (const statement of node.body) walk(statement, nesting, state);
+      state.scopes.pop();
+      return;
     case "IfStatement":
       walkIf(node, nesting, state);
       return;
@@ -105,9 +118,6 @@ function walk(node, nesting, state) {
       walkChildren(node, nesting, state);
       return;
     case "VariableDeclarator":
-      if (node.id?.type === "Identifier" && isFunctionNode(node.init)) {
-        state.scopes.at(-1).set(node.id.name, node.init);
-      }
       walk(node.id, nesting, state);
       walk(node.init, nesting, state);
       return;
@@ -171,6 +181,8 @@ function walkIf(node, nesting, state) {
 function walkSwitch(node, nesting, state) {
   addCognitive(state, 1 + nesting);
   walk(node.discriminant, nesting, state);
+  state.scopes.push(new Map());
+  declareStatements((node.cases || []).flatMap((item) => item.consequent || []), state);
   for (const item of node.cases || []) {
     if (item.test) {
       addCyclomatic(state, 1);
@@ -178,6 +190,7 @@ function walkSwitch(node, nesting, state) {
     }
     for (const stmt of item.consequent || []) walk(stmt, nesting + 1, state);
   }
+  state.scopes.pop();
 }
 
 function walkTry(node, nesting, state) {
@@ -185,8 +198,11 @@ function walkTry(node, nesting, state) {
   if (node.handler) {
     addCognitive(state, 1 + nesting);
     addCyclomatic(state, 1);
+    state.scopes.push(new Map());
+    declarePattern(node.handler.param, null, state.scopes.at(-1));
     if (node.handler.param) walk(node.handler.param, nesting, state);
     walk(node.handler.body, nesting + 1, state);
+    state.scopes.pop();
   }
   if (node.finalizer) walk(node.finalizer, nesting, state);
 }
@@ -194,12 +210,15 @@ function walkTry(node, nesting, state) {
 function walkLoop(node, nesting, state) {
   addCognitive(state, 1 + nesting);
   addCyclomatic(state, 1);
+  state.scopes.push(new Map());
+  declareStatements([node.init, node.left].filter(Boolean), state);
   const keys = VISITOR_KEYS[node.type] || [];
   for (const key of keys) {
     if (key === "body") continue;
     walkValue(node[key], nesting, state);
   }
   walk(node.body, nesting + 1, state);
+  state.scopes.pop();
 }
 
 function walkLogical(node, nesting, state) {
@@ -235,8 +254,13 @@ function flattenLogical(node, items, isRoot) {
 }
 
 function walkFunction(node, nesting, state) {
-  const name = functionName(node);
-  if (state.insideFunction && name && isComponentName(name)) state.metrics.nestedComponents += 1;
+  const name = state.functionNames.get(node) || functionName(node);
+  const isComponent = Boolean(name && (isComponentName(name) || (isMethod(node) && name === "render")) && containsJSX(node, true));
+  if (isComponent && state.functionStack.some((frame) => frame.isComponent)) {
+    state.metrics.nestedComponents += 1;
+    finding(state, "nestedComponents", node, `Component ${name} is defined inside another component`,
+      "Consider moving it to module scope and passing its inputs as props; nested definitions can reset child state.");
+  }
   state.metrics.functions += 1;
   if (node.loc) {
     const length = node.loc.end.line - node.loc.start.line + 1;
@@ -246,13 +270,16 @@ function walkFunction(node, nesting, state) {
   const propCount = countProps(node);
   const bodyNesting = state.insideFunction ? nesting + 1 : 0;
   const cycBefore = state.metrics.cyclomatic;
+  const cognitiveBefore = state.metrics.cognitive;
   const nestedBefore = state.nestedDecisions;
   const prevInside = state.insideFunction;
   state.insideFunction = true;
   state.scopes.push(new Map());
-  if (name) state.scopes.at(-1).set(name, node);
+  if (node.id?.name) state.scopes.at(-1).set(node.id.name, node);
+  for (const param of node.params || []) declarePattern(param, null, state.scopes.at(-1));
+  declareFunctionVars(node.body, state);
   state.functionNodes.push(node);
-  state.functionStack.push({ seenJSX: false, isComponent: Boolean(name && isComponentName(name)) });
+  state.functionStack.push({ seenJSX: false, isComponent });
   if (bodyNesting > state.metrics.maxNesting) state.metrics.maxNesting = bodyNesting;
 
   walkValue(node.params, bodyNesting, state);
@@ -269,6 +296,16 @@ function walkFunction(node, nesting, state) {
   if (frame.seenJSX || frame.isComponent) {
     if (propCount > state.metrics.maxProps) state.metrics.maxProps = propCount;
   }
+  const cognitive = state.metrics.cognitive - cognitiveBefore;
+  if (cognitive >= limit(state, "cognitive")) {
+    finding(state, "cognitive", node, `${name || "Anonymous function"} has cognitive complexity ${cognitive} (including nested functions)`,
+      "Review nested branches and mixed responsibilities; guard clauses or focused helpers may simplify this function.");
+  }
+  const length = node.loc ? node.loc.end.line - node.loc.start.line + 1 : 0;
+  if (length >= limit(state, "maxFunctionLength")) {
+    finding(state, "maxFunctionLength", node, `${name || "Anonymous function"} spans ${length} lines`,
+      "Check for distinct responsibilities before extracting smaller functions; length alone is not a defect.");
+  }
 }
 
 function walkJsxElement(node, nesting, state) {
@@ -276,6 +313,7 @@ function walkJsxElement(node, nesting, state) {
   const depth = state.jsxDepth + 1;
   state.jsxDepth = depth;
   if (depth > state.metrics.jsxDepth) state.metrics.jsxDepth = depth;
+  noteJsxDepth(node, depth, state);
   markJSX(state);
 
   for (const attr of node.openingElement?.attributes || []) {
@@ -295,6 +333,7 @@ function walkJsxFragment(node, nesting, state) {
   const depth = state.jsxDepth + 1;
   state.jsxDepth = depth;
   if (depth > state.metrics.jsxDepth) state.metrics.jsxDepth = depth;
+  noteJsxDepth(node, depth, state);
   markJSX(state);
   for (const child of node.children || []) {
     noteJsxChild(child, state);
@@ -307,7 +346,11 @@ function noteJsxAttribute(attr, state) {
   const expr = jsxExpression(attr.value);
   if (!expr) return;
   state.metrics.jsxExpressions += 1;
-  if (isFunctionNode(expr)) state.metrics.inlineHandlers += 1;
+  if (isFunctionNode(expr)) {
+    state.metrics.inlineHandlers += 1;
+    finding(state, "inlineHandlers", attr, `Inline function passed to JSX prop ${attr.name?.name || "(unknown)"}`,
+      "Keep it inline if it is clear. Extract it for readability when substantial; optimize identity only when profiling or an API requires it.");
+  }
   if (isConditionalRender(expr)) state.metrics.conditionals += 1;
 }
 
@@ -321,14 +364,15 @@ function noteJsxChild(child, state) {
 
 function noteCall(node, nesting, state) {
   const name = calleeName(node.callee);
-  if (name && isHookName(name, state.options.hookPattern)) {
+  const hook = hookName(node.callee, state);
+  if (hook) {
     state.metrics.hooks += 1;
-    if (EFFECT_HOOKS.has(name)) {
+    if (EFFECT_HOOKS.has(hook)) {
       state.metrics.effects += 1;
-      noteDeps(node, state, "effectDeps", "effectsWithoutDeps", name === "useImperativeHandle" ? 2 : 1);
-    } else if (STATE_HOOKS.has(name)) {
+      noteDeps(node, state, "effectDeps", "effectsWithoutDeps", hook === "useImperativeHandle" ? 2 : 1);
+    } else if (STATE_HOOKS.has(hook)) {
       state.metrics.stateHooks += 1;
-    } else if (MEMO_HOOKS.has(name)) {
+    } else if (MEMO_HOOKS.has(hook)) {
       state.metrics.memoHooks += 1;
       noteDeps(node, state, "memoDeps", null);
     } else {
@@ -344,7 +388,11 @@ function noteDeps(node, state, depsKey, missingKey, index = 1) {
   const deps = node.arguments?.[index];
   const expr = unwrapExpression(deps);
   if (!deps || (expr?.type === "Identifier" && expr.name === "undefined")) {
-    if (missingKey) state.metrics[missingKey] += 1;
+    if (missingKey) {
+      state.metrics[missingKey] += 1;
+      finding(state, missingKey, node, `${calleeName(node.callee)} has no dependency array`,
+        "This runs after every applicable render and may be intentional. Review synchronization needs; do not add an empty array without checking dependencies.");
+    }
     return;
   }
   if (expr?.type === "ArrayExpression" && depsKey) {
@@ -372,7 +420,107 @@ function resolveBinding(state, name) {
   for (let i = state.scopes.length - 1; i >= 0; i--) {
     if (state.scopes[i].has(name)) return state.scopes[i].get(name);
   }
+  return undefined;
+}
+
+function declarePattern(pattern, value, scope) {
+  if (!pattern) return;
+  if (pattern.type === "Identifier") scope.set(pattern.name, value);
+  else if (pattern.type === "AssignmentPattern") declarePattern(pattern.left, value, scope);
+  else if (pattern.type === "RestElement") declarePattern(pattern.argument, value, scope);
+  else if (pattern.type === "ObjectPattern") {
+    for (const prop of pattern.properties) declarePattern(prop.value || prop.argument, value, scope);
+  } else if (pattern.type === "ArrayPattern") {
+    for (const element of pattern.elements) declarePattern(element, value, scope);
+  }
+}
+
+function declareStatements(statements, state) {
+  const scope = state.scopes.at(-1);
+  for (const statement of statements || []) {
+    const stmt = statement.declaration || statement;
+    if (stmt.type === "ImportDeclaration") {
+      const source = String(stmt.source.value);
+      const react = (state.options.reactPackages || DEFAULT_REACT_PACKAGES)
+        .some((pkg) => source === pkg || source.startsWith(`${pkg}/`));
+      for (const spec of stmt.specifiers || []) {
+        const runtime = stmt.importKind !== "type" && spec.importKind !== "type";
+        const imported = spec.imported?.name || spec.imported?.value;
+        scope.set(spec.local.name, react && runtime
+          ? { kind: imported ? "react-hook" : "react-namespace", name: imported }
+          : null);
+      }
+    } else if (stmt.type === "FunctionDeclaration" || stmt.type === "ClassDeclaration") {
+      if (stmt.id) scope.set(stmt.id.name, stmt);
+    } else if (stmt.type === "VariableDeclaration") {
+      for (const item of stmt.declarations) {
+        const init = unwrapExpression(item.init);
+        declarePattern(item.id, isFunctionNode(init) ? init : null, scope);
+        let fn = init;
+        while (fn?.type === "CallExpression" && ["memo", "forwardRef", "observer"].includes(calleeName(fn.callee))) {
+          fn = unwrapExpression(fn.arguments[0]);
+        }
+        if (item.id.type === "Identifier" && isFunctionNode(fn)) state.functionNames.set(fn, item.id.name);
+      }
+    }
+  }
+}
+
+function declareFunctionVars(node, state) {
+  if (!node || isFunctionNode(node) || node.type === "ClassDeclaration" || node.type === "ClassExpression") return;
+  if (node.type === "VariableDeclaration" && node.kind === "var") {
+    declareStatements([node], state);
+  }
+  for (const key of VISITOR_KEYS[node.type] || []) {
+    const value = node[key];
+    if (Array.isArray(value)) {
+      for (const child of value) declareFunctionVars(child, state);
+    } else declareFunctionVars(value, state);
+  }
+}
+
+function hookName(callee, state) {
+  if (callee?.type === "Identifier") {
+    const binding = resolveBinding(state, callee.name);
+    const name = binding?.kind === "react-hook" ? binding.name : callee.name;
+    if (!isHookName(name, state.options.hookPattern)) return null;
+    // Known React hooks bound to something else must not acquire React semantics.
+    if (binding !== undefined && binding?.kind !== "react-hook" && REACT_HOOKS.has(name)) return null;
+    return name;
+  }
+  if ((callee?.type === "MemberExpression" || callee?.type === "OptionalMemberExpression") &&
+      !callee.computed && callee.object?.type === "Identifier") {
+    const binding = resolveBinding(state, callee.object.name);
+    if (binding?.kind !== "react-namespace" && !(binding === undefined && callee.object.name === "React")) return null;
+    const name = calleeName(callee);
+    return isHookName(name, state.options.hookPattern) ? name : null;
+  }
   return null;
+}
+
+function limit(state, metric) {
+  return state.options.noteThresholds?.[metric] ?? DEFAULT_NOTE_THRESHOLDS[metric];
+}
+
+function finding(state, metric, node, message, suggestion) {
+  if (!node.loc || !state.options.onFinding) return;
+  state.options.onFinding({
+    metric,
+    message,
+    location: {
+      start: { line: node.loc.start.line, column: node.loc.start.column + 1 },
+      end: { line: node.loc.end.line, column: node.loc.end.column + 1 },
+    },
+    suggestion,
+  });
+}
+
+function noteJsxDepth(node, depth, state) {
+  if (depth === limit(state, "jsxDepth")) {
+    finding(state, "jsxDepth", node.openingElement || node.openingFragment || node,
+      `JSX nesting reaches ${depth} levels`,
+      "Consider extracting a meaningful UI section if it improves readability; avoid splitting markup solely to reduce this number.");
+  }
 }
 
 function propertyName(property) {
@@ -430,8 +578,7 @@ function countProps(fn) {
   if (params.length === 0) return 0;
   let first = params[0];
   if (first.type === "AssignmentPattern") first = first.left;
-  if (first.type === "ObjectPattern") return first.properties.length;
-  if (first.type === "Identifier") return 1;
+  if (first.type === "ObjectPattern") return first.properties.filter((prop) => prop.type !== "RestElement").length;
   return 0;
 }
 

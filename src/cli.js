@@ -4,6 +4,8 @@ import { fileURLToPath } from "node:url";
 import { resolveConfig, renderConfigJson, renderConfigTemplate, parseAssignments } from "./config.js";
 import { analyzePaths, failures, rankResults } from "./scan.js";
 import { formatExplanation, formatReport, helpText, relativeName } from "./format.js";
+import { baselineReport } from "./baseline.js";
+import { exploreReport } from "./interactive.js";
 
 const pkg = JSON.parse(readFileSync(fileURLToPath(new URL("../package.json", import.meta.url)), "utf8"));
 
@@ -17,6 +19,7 @@ const ALIASES = {
   q: "quiet",
   v: "verbose",
   h: "help",
+  i: "interactive",
 };
 
 export async function main(argv = process.argv.slice(2), io = {}) {
@@ -67,6 +70,11 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       stdout.write(`${JSON.stringify(publicConfig(config), null, 2)}\n`);
       return 0;
     }
+    if (parsed.editor !== undefined && !parsed.interactive) throw new Error("--editor requires --interactive.");
+    if (parsed.interactive) {
+      if (config.format !== "table") throw new Error("--interactive requires --format table. Omit --interactive for machine-readable output.");
+      if (!(io.stdin || process.stdin).isTTY || !stdout.isTTY) throw new Error("--interactive requires an interactive terminal (stdin and stdout). Omit it for piped output.");
+    }
 
     const paths = parsed.positionals.length ? parsed.positionals : ["."];
     const oneFile = paths.length === 1 && isFile(path.resolve(cwd, paths[0]));
@@ -79,13 +87,20 @@ export async function main(argv = process.argv.slice(2), io = {}) {
     if (progress) stderr.write("\r\x1b[K");
     const ranked = rankResults(analyzed.results, config);
     const failed = failures(analyzed.results, config.failOn);
+    const baseline = await baselineReport(analyzed, config, paths, parsed);
+    if (baseline.baselineSaved) stderr.write(`Saved baseline ${baseline.baselineSaved}\n`);
     const report = {
       ...analyzed,
       ...ranked,
       failures: failed,
       explain,
+      ...baseline,
     };
-    if (explain && config.format === "table") {
+    if (parsed.interactive) {
+      if (report.comparison) stdout.write(`${formatReport(report, config)}\n`);
+      printProblems(stderr, report, config);
+      await exploreReport(report, config, { ...io, stdout, stderr, editor: parsed.editor });
+    } else if (explain && config.format === "table" && !report.comparison) {
       if (ranked.shown.length === 0 && analyzed.errors.length === 0) stdout.write("No matching React files.\n");
       else stdout.write(`${ranked.shown.map((result) => formatExplanation(result, config)).join("\n")}\n`);
       if (!config.quiet && !(ranked.shown.length === 0 && analyzed.errors.length)) {
@@ -95,9 +110,9 @@ export async function main(argv = process.argv.slice(2), io = {}) {
       const text = formatReport(report, config);
       if (text) stdout.write(`${text}\n`);
     }
-    printProblems(stderr, report, config);
+    if (!parsed.interactive) printProblems(stderr, report, config);
     if (oneFile && analyzed.errors.length && ranked.shown.length === 0) return 1;
-    if ((analyzed.errors.length && config.strict) || failed.length) return 1;
+    if ((analyzed.errors.length && config.strict) || failed.length || report.comparison?.summary.regressions) return 1;
     return 0;
   } catch (error) {
     stderr.write(`${error.message}\n`);
@@ -114,6 +129,10 @@ function printProblems(stderr, analyzed, config) {
   }
   for (const item of analyzed.failures || []) {
     stderr.write(`Failed ${item.failedValue} ${item.failedOn} > ${item.failedLimit}  ${relativeName(item, config)}\n`);
+  }
+  for (const item of analyzed.comparison?.changes || []) {
+    if (!item.regression) continue;
+    stderr.write(`Regression +${item.delta} > tolerance ${analyzed.comparison.tolerance}  ${item.file}${item.name ? `:${item.name}` : ""}\n`);
   }
 }
 
@@ -207,7 +226,7 @@ export function parseArgv(argv) {
     columns: [],
   };
   const multi = new Set(["ignore", "weight", "baseline", "failOn", "ext", "columns"]);
-  const numbers = new Set(["top", "minScore", "maxScore"]);
+  const numbers = new Set(["top", "minScore", "maxScore", "baselineTolerance"]);
   for (let i = 0; i < argv.length; i++) {
     const arg = argv[i];
     if (arg === "--") {
@@ -270,6 +289,7 @@ function isBoolean(name) {
     "strict",
     "noColor",
     "color",
+    "interactive",
   ]).has(name);
 }
 
@@ -290,6 +310,10 @@ function isKnown(name) {
       "minScore",
       "maxScore",
       "failOn",
+      "saveBaseline",
+      "compareBaseline",
+      "baselineTolerance",
+      "editor",
     ]).has(name)
   );
 }

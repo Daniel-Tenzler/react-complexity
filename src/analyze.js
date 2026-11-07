@@ -18,8 +18,9 @@ export function analyzeSource(code, filename = "input.jsx", options = {}) {
   }
 
   let metrics;
+  const findings = [];
   try {
-    metrics = measure(parsed.ast.program, analysisOptions(options));
+    metrics = measure(parsed.ast.program, analysisOptions(options, parsed.ast.program, findings));
   } catch (error) {
     const message = error instanceof RangeError ? "File is too deeply nested to analyze" : error.message;
     return resultFrom(filename, emptyMetrics(), options, {
@@ -45,6 +46,7 @@ export function analyzeSource(code, filename = "input.jsx", options = {}) {
     react,
     notes,
     partial: Boolean(parsed.recovered),
+    findings: sourceFindings(findings, code),
   });
 }
 
@@ -58,14 +60,17 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
 
   const componentResults = units.map((unit) => {
     let metrics;
+    const findings = [];
     try {
-      metrics = measure(unit.node, analysisOptions(options));
+      metrics = measure(unit.node, analysisOptions(options, parsed.ast.program, findings));
     } catch (error) {
       return {
         ...fileResult,
         name: unit.name,
         kind: "component",
         parseError: error.message,
+        partial: false,
+        findings: [],
       };
     }
     const start = unit.node.loc?.start.line ?? 1;
@@ -75,26 +80,34 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
     metrics.sloc = size.sloc;
     metrics.components = 1;
     const notes = buildNotes(metrics, options.noteThresholds);
+    if (parsed.recovered) notes.unshift("Parse recovered with errors; score may be incomplete");
     return {
       ...resultFrom(filename, metrics, options, {
-        parseError: null,
+        parseError: parsed.recovered || null,
+        partial: Boolean(parsed.recovered),
         components: [unit.name],
         react: true,
         notes,
+        findings: sourceFindings(findings, code),
+        location: {
+          start: { line: unit.node.loc.start.line, column: unit.node.loc.start.column + 1 },
+          end: { line: unit.node.loc.end.line, column: unit.node.loc.end.column + 1 },
+        },
       }),
       name: unit.name,
       kind: "component",
     };
   });
-  const moduleRow = moduleRemainder(parsed.ast.program, units, fileResult, componentResults, code, parsed.ast.comments, options);
+  const moduleRow = moduleRemainder(parsed.ast.program, units, fileResult, componentResults, code, options);
   if (moduleRow) componentResults.push(moduleRow);
   return componentResults;
 }
 
-function moduleRemainder(program, units, fileResult, componentResults, code, comments, options) {
+function moduleRemainder(program, units, fileResult, componentResults, code, options) {
   let metrics;
+  const findings = [];
   try {
-    metrics = measure(program, analysisOptions(options), new Set(units.map((unit) => unit.node)));
+    metrics = measure(program, analysisOptions(options, program, findings), new Set(units.map((unit) => unit.node)));
   } catch {
     return null;
   }
@@ -104,14 +117,16 @@ function moduleRemainder(program, units, fileResult, componentResults, code, com
   metrics.sloc = Math.max(0, fileResult.metrics.sloc - coveredSloc);
   metrics.loc = Math.max(0, fileResult.metrics.loc - coveredLoc);
   metrics.components = 0;
-  void code;
-  void comments;
+  const notes = buildNotes(metrics, options.noteThresholds);
+  if (fileResult.partial) notes.unshift("Parse recovered with errors; score may be incomplete");
   return {
     ...resultFrom(fileResult.file, metrics, options, {
-      parseError: null,
+      parseError: fileResult.parseError,
+      partial: Boolean(fileResult.partial),
       components: [],
       react: true,
-      notes: buildNotes(metrics, options.noteThresholds),
+      notes,
+      findings: sourceFindings(findings, code),
     }),
     name: "(module)",
     kind: "module",
@@ -124,18 +139,30 @@ function resultFrom(filename, metrics, options, extra) {
     file: filename,
     name: null,
     kind: "file",
+    findings: [],
     metrics,
     ...scored,
     ...extra,
   };
 }
 
-function analysisOptions(options) {
+function analysisOptions(options, program, findings) {
   return {
     countLogical: options.countLogical !== false,
     countNullish: options.countNullish !== false,
     hookPattern: options.hookPattern || "^use[A-Z]",
+    program,
+    reactPackages: options.reactPackages,
+    noteThresholds: options.noteThresholds,
+    onFinding: (item) => findings.push(item),
   };
+}
+
+function sourceFindings(findings, code) {
+  const lines = code.split(/\r?\n/);
+  return findings
+    .sort((a, b) => a.location.start.line - b.location.start.line || a.location.start.column - b.location.start.column || a.metric.localeCompare(b.metric))
+    .map((item) => ({ ...item, evidence: (lines[item.location.start.line - 1] || "").trim().slice(0, 200) }));
 }
 
 export function parseSource(code, filename, options = {}) {

@@ -4,7 +4,7 @@ export const METRICS = {
     baseline: 0,
     label: "Cogn",
     column: true,
-    description: "Sonar cognitive complexity (nested flow costs more than flat branches)",
+    description: "Sonar-style cognitive complexity (nested flow costs more than flat branches; not a SonarSource conformance guarantee)",
   },
   cyclomatic: {
     weight: 0.35,
@@ -144,7 +144,7 @@ export const METRICS = {
     baseline: 3,
     label: "Props",
     column: false,
-    description: "Most props on a single component",
+    description: "Most explicitly destructured props on a component (excludes rest; opaque props parameters are unknown and counted as 0)",
   },
   sloc: {
     weight: 0.015,
