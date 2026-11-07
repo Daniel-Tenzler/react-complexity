@@ -58,6 +58,17 @@ export function formatExplanation(result, config) {
       `  ${formatPrecise(item.points).padStart(7)}   ${key.padEnd(20)} ${String(item.raw).padStart(4)} ${String(item.baseline).padStart(6)}   ${formatPrecise(item.weight).padStart(6)}   ${METRICS[key].description}`,
     );
   }
+  const sources = metricSourceEntries(result, config);
+  if (sources.length) {
+    lines.push("", "  metric sources (raw contributions; maxima identify the first highest location):");
+    const file = relativeName({ file: result.file }, config);
+    for (const [index, source] of sources.entries()) {
+      const { line, column } = source.location.start;
+      lines.push(`    ${config.numberFindings ? `[s${index + 1}] ` : ""}${file}:${line}:${column} — ${source.metric}: ${source.value}`);
+      if (source.evidence) lines.push(`      > ${source.evidence}`);
+      if (source.ranges) lines.push(`      scope: ${source.ranges.map((range) => `${file}:${range.start.line}:${range.start.column}–${range.end.line}:${range.end.column}`).join(", ")}`);
+    }
+  }
   if (result.metrics.hooks > 0) {
     lines.push("");
     lines.push(
@@ -178,6 +189,7 @@ function formatJson(report, config) {
       components: result.components,
       notes: result.notes,
       findings: result.findings || [],
+      metricSources: result.metricSources || {},
       parseError: result.parseError,
       partial: Boolean(result.partial),
     })),
@@ -196,6 +208,13 @@ function formatJson(report, config) {
     ...(report.baselineSaved ? { baselineSaved: report.baselineSaved } : {}),
   };
   return JSON.stringify(payload, null, config.compact ? 0 : 2);
+}
+
+export function metricSourceEntries(result, config) {
+  return Object.entries(result.breakdown || {})
+    .filter(([, item]) => config.verbose || (item.weight !== 0 && (item.points > 0 || item.raw > 0)))
+    .sort((a, b) => b[1].points - a[1].points || a[0].localeCompare(b[0]))
+    .flatMap(([metric]) => result.metricSources?.[metric] || []);
 }
 
 function tableColumns(config) {

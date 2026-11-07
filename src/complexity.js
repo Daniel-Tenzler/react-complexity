@@ -81,7 +81,7 @@ function walk(node, nesting, state) {
     return;
   }
 
-  if (nesting > state.metrics.maxNesting) state.metrics.maxNesting = nesting;
+  maxMetric(state, "maxNesting", nesting, node);
 
   switch (node.type) {
     case "BlockStatement":
@@ -94,8 +94,8 @@ function walk(node, nesting, state) {
       walkIf(node, nesting, state);
       return;
     case "ConditionalExpression":
-      addCognitive(state, 1 + nesting);
-      addCyclomatic(state, 1);
+      addCognitive(state, 1 + nesting, node);
+      addCyclomatic(state, 1, node);
       walk(node.test, nesting, state);
       walk(node.consequent, nesting + 1, state);
       walk(node.alternate, nesting + 1, state);
@@ -112,8 +112,8 @@ function walk(node, nesting, state) {
     case "AssignmentExpression":
       if (node.operator === "&&=" || node.operator === "||=" || node.operator === "??=") {
         const logicalOp = node.operator.slice(0, -1);
-        if (logicalOp !== "??") addCognitive(state, 1 + nesting);
-        if (countsAsDecision(logicalOp, state.options)) addCyclomatic(state, 1);
+        if (logicalOp !== "??") addCognitive(state, 1 + nesting, node);
+        if (countsAsDecision(logicalOp, state.options)) addCyclomatic(state, 1, node);
       }
       walkChildren(node, nesting, state);
       return;
@@ -123,7 +123,7 @@ function walk(node, nesting, state) {
       return;
     case "BreakStatement":
     case "ContinueStatement":
-      if (node.label) addCognitive(state, 1 + nesting);
+      if (node.label) addCognitive(state, 1 + nesting, node);
       return;
     case "CallExpression":
     case "OptionalCallExpression":
@@ -134,10 +134,10 @@ function walk(node, nesting, state) {
     case "ImportDeclaration":
       if (node.importKind === "type") return;
       if (!node.specifiers?.length) {
-        state.metrics.imports += 1;
+        addMetric(state, "imports", 1, node);
         return;
       }
-      state.metrics.imports += node.specifiers.filter((spec) => spec.importKind !== "type").length;
+      for (const spec of node.specifiers.filter((spec) => spec.importKind !== "type")) addMetric(state, "imports", 1, spec);
       return;
     case "JSXElement":
       walkJsxElement(node, nesting, state);
@@ -158,20 +158,20 @@ function walk(node, nesting, state) {
 }
 
 function walkIf(node, nesting, state) {
-  addCognitive(state, 1 + nesting);
-  addCyclomatic(state, 1);
+  addCognitive(state, 1 + nesting, node);
+  addCyclomatic(state, 1, node);
   walk(node.test, nesting, state);
   walk(node.consequent, nesting + 1, state);
   let alt = node.alternate;
   while (alt) {
     if (alt.type === "IfStatement") {
-      addCognitive(state, 1);
-      addCyclomatic(state, 1);
+      addCognitive(state, 1, alt);
+      addCyclomatic(state, 1, alt);
       walk(alt.test, nesting, state);
       walk(alt.consequent, nesting + 1, state);
       alt = alt.alternate;
     } else {
-      addCognitive(state, 1);
+      addCognitive(state, 1, alt);
       walk(alt, nesting + 1, state);
       break;
     }
@@ -179,13 +179,13 @@ function walkIf(node, nesting, state) {
 }
 
 function walkSwitch(node, nesting, state) {
-  addCognitive(state, 1 + nesting);
+  addCognitive(state, 1 + nesting, node);
   walk(node.discriminant, nesting, state);
   state.scopes.push(new Map());
   declareStatements((node.cases || []).flatMap((item) => item.consequent || []), state);
   for (const item of node.cases || []) {
     if (item.test) {
-      addCyclomatic(state, 1);
+      addCyclomatic(state, 1, item);
       walk(item.test, nesting, state);
     }
     for (const stmt of item.consequent || []) walk(stmt, nesting + 1, state);
@@ -196,8 +196,8 @@ function walkSwitch(node, nesting, state) {
 function walkTry(node, nesting, state) {
   walk(node.block, nesting, state);
   if (node.handler) {
-    addCognitive(state, 1 + nesting);
-    addCyclomatic(state, 1);
+    addCognitive(state, 1 + nesting, node.handler);
+    addCyclomatic(state, 1, node.handler);
     state.scopes.push(new Map());
     declarePattern(node.handler.param, null, state.scopes.at(-1));
     if (node.handler.param) walk(node.handler.param, nesting, state);
@@ -208,8 +208,8 @@ function walkTry(node, nesting, state) {
 }
 
 function walkLoop(node, nesting, state) {
-  addCognitive(state, 1 + nesting);
-  addCyclomatic(state, 1);
+  addCognitive(state, 1 + nesting, node);
+  addCyclomatic(state, 1, node);
   state.scopes.push(new Map());
   declareStatements([node.init, node.left].filter(Boolean), state);
   const keys = VISITOR_KEYS[node.type] || [];
@@ -228,10 +228,10 @@ function walkLogical(node, nesting, state) {
   for (const item of items) {
     if (item.op) {
       if (item.op !== lastOp) {
-        if (item.op !== "??") addCognitive(state, 1 + nesting);
+        if (item.op !== "??") addCognitive(state, 1 + nesting, item.node);
         lastOp = item.op;
       }
-      if (countsAsDecision(item.op, state.options)) addCyclomatic(state, 1);
+      if (countsAsDecision(item.op, state.options)) addCyclomatic(state, 1, item.node);
     } else {
       walk(item.node, nesting, state);
     }
@@ -246,7 +246,7 @@ function flattenLogical(node, items, isRoot) {
     (isRoot || !node.extra?.parenthesized)
   ) {
     flattenLogical(node.left, items, false);
-    items.push({ op: node.operator });
+    items.push({ op: node.operator, node });
     flattenLogical(node.right, items, false);
     return;
   }
@@ -257,14 +257,14 @@ function walkFunction(node, nesting, state) {
   const name = state.functionNames.get(node) || functionName(node);
   const isComponent = Boolean(name && (isComponentName(name) || (isMethod(node) && name === "render")) && containsJSX(node, true));
   if (isComponent && state.functionStack.some((frame) => frame.isComponent)) {
-    state.metrics.nestedComponents += 1;
+    addMetric(state, "nestedComponents", 1, node);
     finding(state, "nestedComponents", node, `Component ${name} is defined inside another component`,
       "Consider moving it to module scope and passing its inputs as props; nested definitions can reset child state.");
   }
-  state.metrics.functions += 1;
+  addMetric(state, "functions", 1, node);
   if (node.loc) {
     const length = node.loc.end.line - node.loc.start.line + 1;
-    if (length > state.metrics.maxFunctionLength) state.metrics.maxFunctionLength = length;
+    maxMetric(state, "maxFunctionLength", length, node);
   }
 
   const propCount = countProps(node);
@@ -280,7 +280,7 @@ function walkFunction(node, nesting, state) {
   declareFunctionVars(node.body, state);
   state.functionNodes.push(node);
   state.functionStack.push({ seenJSX: false, isComponent });
-  if (bodyNesting > state.metrics.maxNesting) state.metrics.maxNesting = bodyNesting;
+  maxMetric(state, "maxNesting", bodyNesting, node);
 
   walkValue(node.params, bodyNesting, state);
   walk(node.body, bodyNesting, state);
@@ -292,9 +292,9 @@ function walkFunction(node, nesting, state) {
   const ownDecisions = state.metrics.cyclomatic - cycBefore - (state.nestedDecisions - nestedBefore);
   state.nestedDecisions += ownDecisions;
   const mccabe = 1 + ownDecisions;
-  if (mccabe > state.metrics.maxCyclomatic) state.metrics.maxCyclomatic = mccabe;
+  maxMetric(state, "maxCyclomatic", mccabe, node);
   if (frame.seenJSX || frame.isComponent) {
-    if (propCount > state.metrics.maxProps) state.metrics.maxProps = propCount;
+    maxMetric(state, "maxProps", propCount, node.params?.[0] || node);
   }
   const cognitive = state.metrics.cognitive - cognitiveBefore;
   if (cognitive >= limit(state, "cognitive")) {
@@ -309,16 +309,16 @@ function walkFunction(node, nesting, state) {
 }
 
 function walkJsxElement(node, nesting, state) {
-  state.metrics.jsxElements += 1;
+  addMetric(state, "jsxElements", 1, node.openingElement);
   const depth = state.jsxDepth + 1;
   state.jsxDepth = depth;
-  if (depth > state.metrics.jsxDepth) state.metrics.jsxDepth = depth;
+  maxMetric(state, "jsxDepth", depth, node.openingElement);
   noteJsxDepth(node, depth, state);
   markJSX(state);
 
   for (const attr of node.openingElement?.attributes || []) {
     if (!attr) continue;
-    if (attr.type === "JSXSpreadAttribute") state.metrics.spreads += 1;
+    if (attr.type === "JSXSpreadAttribute") addMetric(state, "spreads", 1, attr);
     if (attr.type === "JSXAttribute") noteJsxAttribute(attr, state);
   }
   for (const child of node.children || []) noteJsxChild(child, state);
@@ -332,7 +332,7 @@ function walkJsxElement(node, nesting, state) {
 function walkJsxFragment(node, nesting, state) {
   const depth = state.jsxDepth + 1;
   state.jsxDepth = depth;
-  if (depth > state.metrics.jsxDepth) state.metrics.jsxDepth = depth;
+  maxMetric(state, "jsxDepth", depth, node.openingFragment);
   noteJsxDepth(node, depth, state);
   markJSX(state);
   for (const child of node.children || []) {
@@ -345,42 +345,42 @@ function walkJsxFragment(node, nesting, state) {
 function noteJsxAttribute(attr, state) {
   const expr = jsxExpression(attr.value);
   if (!expr) return;
-  state.metrics.jsxExpressions += 1;
+  addMetric(state, "jsxExpressions", 1, attr.value);
   if (isFunctionNode(expr)) {
-    state.metrics.inlineHandlers += 1;
+    addMetric(state, "inlineHandlers", 1, attr);
     finding(state, "inlineHandlers", attr, `Inline function passed to JSX prop ${attr.name?.name || "(unknown)"}`,
       "Keep it inline if it is clear. Extract it for readability when substantial; optimize identity only when profiling or an API requires it.");
   }
-  if (isConditionalRender(expr)) state.metrics.conditionals += 1;
+  if (isConditionalRender(expr)) addMetric(state, "conditionals", 1, expr);
 }
 
 function noteJsxChild(child, state) {
   if (!child || child.type !== "JSXExpressionContainer") return;
   const expr = unwrapExpression(child.expression);
   if (!expr || expr.type === "JSXEmptyExpression") return;
-  state.metrics.jsxExpressions += 1;
-  if (isConditionalRender(expr)) state.metrics.conditionals += 1;
+  addMetric(state, "jsxExpressions", 1, child);
+  if (isConditionalRender(expr)) addMetric(state, "conditionals", 1, expr);
 }
 
 function noteCall(node, nesting, state) {
   const name = calleeName(node.callee);
   const hook = hookName(node.callee, state);
   if (hook) {
-    state.metrics.hooks += 1;
+    addMetric(state, "hooks", 1, node);
     if (EFFECT_HOOKS.has(hook)) {
-      state.metrics.effects += 1;
+      addMetric(state, "effects", 1, node);
       noteDeps(node, state, "effectDeps", "effectsWithoutDeps", hook === "useImperativeHandle" ? 2 : 1);
     } else if (STATE_HOOKS.has(hook)) {
-      state.metrics.stateHooks += 1;
+      addMetric(state, "stateHooks", 1, node);
     } else if (MEMO_HOOKS.has(hook)) {
-      state.metrics.memoHooks += 1;
+      addMetric(state, "memoHooks", 1, node);
       noteDeps(node, state, "memoDeps", null);
     } else {
-      state.metrics.customHooks += 1;
+      addMetric(state, "customHooks", 1, node);
     }
   }
-  if (isRecursiveCall(node, state)) addCognitive(state, 1);
-  if (name === "require") state.metrics.imports += 1;
+  if (isRecursiveCall(node, state)) addCognitive(state, 1, node);
+  if (name === "require") addMetric(state, "imports", 1, node);
   void nesting;
 }
 
@@ -389,14 +389,14 @@ function noteDeps(node, state, depsKey, missingKey, index = 1) {
   const expr = unwrapExpression(deps);
   if (!deps || (expr?.type === "Identifier" && expr.name === "undefined")) {
     if (missingKey) {
-      state.metrics[missingKey] += 1;
+      addMetric(state, missingKey, 1, node);
       finding(state, missingKey, node, `${calleeName(node.callee)} has no dependency array`,
         "This runs after every applicable render and may be intentional. Review synchronization needs; do not add an empty array without checking dependencies.");
     }
     return;
   }
   if (expr?.type === "ArrayExpression" && depsKey) {
-    state.metrics[depsKey] += expr.elements.filter((item) => item && item.type !== "SpreadElement").length;
+    for (const item of expr.elements.filter((item) => item && item.type !== "SpreadElement")) addMetric(state, depsKey, 1, item);
   }
 }
 
@@ -554,12 +554,23 @@ function walkValue(value, nesting, state) {
   walk(value, nesting, state);
 }
 
-function addCognitive(state, amount) {
-  state.metrics.cognitive += amount;
+function addMetric(state, metric, value, node) {
+  state.metrics[metric] += value;
+  if (value > 0) state.options.onMetricSource?.(metric, value, node, false);
 }
 
-function addCyclomatic(state, amount) {
-  state.metrics.cyclomatic += amount;
+function maxMetric(state, metric, value, node) {
+  if (value <= state.metrics[metric]) return;
+  state.metrics[metric] = value;
+  state.options.onMetricSource?.(metric, value, node, true);
+}
+
+function addCognitive(state, amount, node) {
+  addMetric(state, "cognitive", amount, node);
+}
+
+function addCyclomatic(state, amount, node) {
+  addMetric(state, "cyclomatic", amount, node);
 }
 
 function countsAsDecision(op, options) {

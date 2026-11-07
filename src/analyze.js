@@ -19,8 +19,9 @@ export function analyzeSource(code, filename = "input.jsx", options = {}) {
 
   let metrics;
   const findings = [];
+  const sources = {};
   try {
-    metrics = measure(parsed.ast.program, analysisOptions(options, parsed.ast.program, findings));
+    metrics = measure(parsed.ast.program, analysisOptions(options, parsed.ast.program, findings, sources));
   } catch (error) {
     const message = error instanceof RangeError ? "File is too deeply nested to analyze" : error.message;
     return resultFrom(filename, emptyMetrics(), options, {
@@ -36,6 +37,8 @@ export function analyzeSource(code, filename = "input.jsx", options = {}) {
   metrics.sloc = size.sloc;
   const components = findComponents(parsed.ast);
   metrics.components = components.length;
+  for (const component of components) recordSource(sources, "components", 1, component.node);
+  recordSizeSources(sources, code, parsed.ast.comments, 1, lineCount(code));
   const react = isReact(parsed.ast, metrics, options);
   const notes = buildNotes(metrics, options.noteThresholds);
   const parseError = parsed.recovered ? parsed.recovered : null;
@@ -47,6 +50,7 @@ export function analyzeSource(code, filename = "input.jsx", options = {}) {
     notes,
     partial: Boolean(parsed.recovered),
     findings: sourceFindings(findings, code),
+    metricSources: sourceMetrics(sources, code),
   });
 }
 
@@ -61,8 +65,9 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
   const componentResults = units.map((unit) => {
     let metrics;
     const findings = [];
+    const sources = {};
     try {
-      metrics = measure(unit.node, analysisOptions(options, parsed.ast.program, findings));
+      metrics = measure(unit.node, analysisOptions(options, parsed.ast.program, findings, sources));
     } catch (error) {
       return {
         ...fileResult,
@@ -71,6 +76,7 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
         parseError: error.message,
         partial: false,
         findings: [],
+        metricSources: {},
       };
     }
     const start = unit.node.loc?.start.line ?? 1;
@@ -79,6 +85,8 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
     metrics.loc = size.loc;
     metrics.sloc = size.sloc;
     metrics.components = 1;
+    recordSource(sources, "components", 1, unit.node);
+    recordSizeSources(sources, code, parsed.ast.comments, start, end);
     const notes = buildNotes(metrics, options.noteThresholds);
     if (parsed.recovered) notes.unshift("Parse recovered with errors; score may be incomplete");
     return {
@@ -89,6 +97,7 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
         react: true,
         notes,
         findings: sourceFindings(findings, code),
+        metricSources: sourceMetrics(sources, code),
         location: {
           start: { line: unit.node.loc.start.line, column: unit.node.loc.start.column + 1 },
           end: { line: unit.node.loc.end.line, column: unit.node.loc.end.column + 1 },
@@ -106,8 +115,9 @@ export function analyzeComponents(code, filename = "input.jsx", options = {}) {
 function moduleRemainder(program, units, fileResult, componentResults, code, options) {
   let metrics;
   const findings = [];
+  const sources = {};
   try {
-    metrics = measure(program, analysisOptions(options, program, findings), new Set(units.map((unit) => unit.node)));
+    metrics = measure(program, analysisOptions(options, program, findings, sources), new Set(units.map((unit) => unit.node)));
   } catch {
     return null;
   }
@@ -117,6 +127,23 @@ function moduleRemainder(program, units, fileResult, componentResults, code, opt
   metrics.sloc = Math.max(0, fileResult.metrics.sloc - coveredSloc);
   metrics.loc = Math.max(0, fileResult.metrics.loc - coveredLoc);
   metrics.components = 0;
+  const coveredLines = new Set();
+  for (const unit of units) {
+    for (let line = unit.node.loc.start.line; line <= unit.node.loc.end.line; line++) coveredLines.add(line);
+  }
+  const lastLine = lineCount(code);
+  const ranges = [];
+  const lines = code.split(/\r?\n/);
+  for (let line = 1; line <= lastLine; line++) {
+    if (coveredLines.has(line)) continue;
+    const start = line;
+    while (line < lastLine && !coveredLines.has(line + 1)) line++;
+    ranges.push({ start: { line: start, column: 1 }, end: { line, column: lines[line - 1].length + 1 } });
+  }
+  for (const metric of ["loc", "sloc"]) {
+    if (metrics[metric] <= 0 || !ranges.length) continue;
+    sources[metric] = [{ metric, value: metrics[metric], location: ranges[0], ranges }];
+  }
   const notes = buildNotes(metrics, options.noteThresholds);
   if (fileResult.partial) notes.unshift("Parse recovered with errors; score may be incomplete");
   return {
@@ -127,6 +154,7 @@ function moduleRemainder(program, units, fileResult, componentResults, code, opt
       react: true,
       notes,
       findings: sourceFindings(findings, code),
+      metricSources: sourceMetrics(sources, code),
     }),
     name: "(module)",
     kind: "module",
@@ -140,13 +168,14 @@ function resultFrom(filename, metrics, options, extra) {
     name: null,
     kind: "file",
     findings: [],
+    metricSources: {},
     metrics,
     ...scored,
     ...extra,
   };
 }
 
-function analysisOptions(options, program, findings) {
+function analysisOptions(options, program, findings, sources) {
   return {
     countLogical: options.countLogical !== false,
     countNullish: options.countNullish !== false,
@@ -155,7 +184,34 @@ function analysisOptions(options, program, findings) {
     reactPackages: options.reactPackages,
     noteThresholds: options.noteThresholds,
     onFinding: (item) => findings.push(item),
+    onMetricSource: (metric, value, node, maximum) => recordSource(sources, metric, value, node, maximum),
   };
+}
+
+function recordSource(sources, metric, value, node, maximum = false) {
+  if (!node?.loc || value <= 0) return;
+  const entry = {
+    metric,
+    value,
+    location: {
+      start: { line: node.loc.start.line, column: node.loc.start.column + 1 },
+      end: { line: node.loc.end.line, column: node.loc.end.column + 1 },
+    },
+  };
+  if (maximum) sources[metric] = [entry];
+  else (sources[metric] ||= []).push(entry);
+}
+
+function recordSizeSources(sources, code, comments, start, end) {
+  const lines = code.split(/\r?\n/);
+  const node = { loc: { start: { line: start, column: 0 }, end: { line: end, column: (lines[end - 1] || "").length } } };
+  const size = countSloc(code, comments, start, end);
+  recordSource(sources, "loc", size.loc, node);
+  recordSource(sources, "sloc", size.sloc, node);
+}
+
+function sourceMetrics(sources, code) {
+  return Object.fromEntries(Object.entries(sources).map(([metric, entries]) => [metric, sourceFindings(entries, code)]));
 }
 
 function sourceFindings(findings, code) {

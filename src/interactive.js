@@ -1,12 +1,12 @@
 import { createInterface } from "node:readline";
 import { rankResults } from "./scan.js";
 import { normalizeSort } from "./schema.js";
-import { formatExplanation, formatPrecise, relativeName } from "./format.js";
+import { formatExplanation, formatPrecise, metricSourceEntries, relativeName } from "./format.js";
 import { openInEditor } from "./editor.js";
 
 const PAGE_SIZE = 10;
 const HELP = "Enter a result number to inspect · n/p next/previous page · /text filter (/ clears) · s metric sort · q quit";
-const DETAIL_HELP = "o opens this entry · o N opens finding N · b back to rankings · q quit";
+const DETAIL_HELP = "o opens this entry · o N opens finding N · o sN opens metric source sN · b back to rankings · q quit";
 
 export async function exploreReport(report, config, io = {}) {
   const input = io.stdin || process.stdin;
@@ -55,11 +55,13 @@ export async function exploreReport(report, config, io = {}) {
         if (command === "b" || command === "back") {
           selected = null;
           showList();
-        } else if (/^o(?:\s+\d+)?$/.test(command)) {
-          const number = command === "o" ? null : Number(command.slice(1).trim());
-          const finding = number === null ? null : selected.findings?.[number - 1];
+        } else if (/^o(?:\s+s?\d+)?$/.test(command)) {
+          const token = command.slice(1).trim();
+          const source = token.startsWith("s");
+          const number = command === "o" ? null : Number(source ? token.slice(1) : token);
+          const finding = number === null ? null : (source ? metricSourceEntries(selected, config) : selected.findings)?.[number - 1];
           if (number !== null && (!Number.isSafeInteger(number) || !finding)) {
-            errors.write("Choose a valid finding number from this entry.\n");
+            errors.write(source ? "Choose a valid metric source number from this entry.\n" : "Choose a valid finding number from this entry.\n");
             continue;
           }
           const location = finding?.location.start || selected.location?.start || { line: 1, column: 1 };

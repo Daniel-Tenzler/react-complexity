@@ -43,6 +43,7 @@ Inside an entry, findings are numbered:
 | --- | --- |
 | `o` | Open the component's start, or line 1 for a file/module row |
 | `o 2` | Open finding 2 at its exact line and column |
+| `o s2` | Open metric source s2 at its exact line and column |
 | `b` | Return to the rankings |
 | `q` | Quit |
 
@@ -57,6 +58,12 @@ The explorer pages through **all results meeting `--min-score`**, regardless of 
 Interactive mode requires terminal input/output and the `table` format. Ordinary commands never prompt, including when piped; omit `--interactive` for JSON, CSV, Markdown, or list output.
 
 ## Source-linked findings
+
+Single-file reports also include **metric sources**, independently of finding thresholds. Each source gives a file, line, column, raw contribution, and source excerpt—without interpreting whether a change is needed. This covers all metrics, including hooks, effects, conditional renders, prop spreads, imports, and individual control-flow contributions.
+
+Additive metrics list their contributing locations. Maximum metrics (such as JSX depth and longest function) link to the first location reaching the final maximum, not every intermediate maximum. LOC/SLOC link to the measured source scope. Module size references include a `ranges` array excluding component lines and retain the existing aggregate count (file size minus summed component sizes, clamped to zero). These are raw metric values, not per-location score penalties: weights and baselines are applied to the aggregate metric.
+
+Text reports show sources for the metrics in the breakdown; `--verbose` includes zero-weight metrics. Interactive reports label sources `s1`, `s2`, etc.; use `o s2` to open one. JSON and library results always include all available references in `metricSources`, keyed by metric. Each entry contains `metric`, `value`, `location`, and `evidence`, using the same location conventions as findings. Scores and finding thresholds are unchanged.
 
 Single-file explanations (or directory scans with `--explain`) include findings with file, line, column, source evidence, and contextual suggestions. Findings cover:
 
